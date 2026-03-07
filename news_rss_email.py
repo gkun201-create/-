@@ -12,7 +12,8 @@ import feedparser
 
 
 def google_news_rss_url(keyword: str, hl="ko", gl="KR", ceid="KR:ko") -> str:
-    q = quote(keyword)
+    # 24시간 이내 검색을 위해 키워드에 when:24h를 붙입니다.
+    q = quote(f"{keyword} when:24h")
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 
@@ -26,16 +27,16 @@ def fetch_news(keyword: str, limit: int = 10, within_hours: int = 24):
     for entry in feed.entries:
         if len(items) >= limit:
             break
-        published_str = getattr(entry, "published", "").strip()
-        # 24시간 이내인지 확인 (published_parsed가 있으면)
+        
+        # 24시간 이내 뉴스인지 확인
         if getattr(entry, "published_parsed", None):
             pub_dt = datetime.fromtimestamp(mktime(entry.published_parsed), tz=timezone.utc)
             if pub_dt < cutoff:
                 continue
+                
         title = getattr(entry, "title", "").strip()
         link = getattr(entry, "link", "").strip()
-        summary_raw = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
-        summary_text = _clean_summary(summary_raw)
+        published_str = getattr(entry, "published", "").strip()
 
         source_title = ""
         try:
@@ -48,47 +49,10 @@ def fetch_news(keyword: str, limit: int = 10, within_hours: int = 24):
                 "title": title,
                 "link": link,
                 "published": published_str,
-                "summary": summary_text,
                 "source": source_title,
             }
         )
     return items
-
-
-def _clean_summary(text: str) -> str:
-    # Google News RSS summary는 HTML이 섞여올 수 있어 텍스트만 남깁니다.
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = html.unescape(text)
-    return " ".join(text.split()).strip()
-
-
-def _is_ascii(s: str) -> bool:
-    return all(ord(ch) < 128 for ch in (s or ""))
-
-
-def _highlight_keyword(text: str, keyword: str) -> str:
-    """
-    HTML-safe 문자열을 반환하고, keyword 매칭 부분만 <strong> 처리합니다.
-    (대소문자 구분이 애매한 영문 키워드는 IGNORECASE로 처리)
-    """
-    if not text:
-        return ""
-    if not keyword:
-        return html.escape(text)
-
-    flags = re.IGNORECASE if _is_ascii(keyword) else 0
-    pattern = re.compile(re.escape(keyword), flags)
-
-    out = []
-    last = 0
-    for m in pattern.finditer(text):
-        out.append(html.escape(text[last : m.start()]))
-        out.append("<strong>")
-        out.append(html.escape(text[m.start() : m.end()]))
-        out.append("</strong>")
-        last = m.end()
-    out.append(html.escape(text[last:]))
-    return "".join(out)
 
 
 def build_email_body(results: dict) -> str:
@@ -104,33 +68,28 @@ def build_email_body(results: dict) -> str:
     a { color: #1967d2; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .meta { color: #666; font-size: 12px; margin-top: 4px; }
-    .summary { color: #222; font-size: 13px; margin-top: 6px; line-height: 1.4; }
     </style>
     """
-    parts = [f"<html><head>{style}</head><body>", "<h2>Google 뉴스 RSS 요약</h2>"]
+    parts = [f"<html><head>{style}</head><body>", "<h2>설정 키워드 뉴스 브리핑 (최근 24시간)</h2>"]
     for keyword, items in results.items():
         parts.append(f"<h3>[{html.escape(keyword)}] ({len(items)}개)</h3>")
         if not items:
-            parts.append("<p>결과 없음</p>")
+            parts.append("<p>최근 24시간 내 결과 없음</p>")
             continue
         parts.append(
             "<table>"
-            "<thead><tr><th>#</th><th>제목 / 요약</th><th>발행</th></tr></thead><tbody>"
+            "<thead><tr><th>#</th><th>제목</th><th>발행</th></tr></thead><tbody>"
         )
         for i, it in enumerate(items, 1):
             link_esc = html.escape(it["link"])
             pub_esc = html.escape(it.get("published", "") or "")
             src_esc = html.escape(it.get("source", "") or "")
+            title_esc = html.escape(it.get("title", "") or "")
 
-            title_html = _highlight_keyword(it.get("title", "") or "", keyword)
-            summary_html = _highlight_keyword(it.get("summary", "") or "", keyword) if it.get("summary") else ""
-
-            title_cell = f'<a href="{link_esc}">{title_html}</a>'
-            meta_bits = [b for b in [src_esc] if b]
-            if meta_bits:
-                title_cell += f'<div class="meta">{" · ".join(meta_bits)}</div>'
-            if summary_html:
-                title_cell += f'<div class="summary">{summary_html}</div>'
+            # 볼드 처리와 요약 없이 제목만 깔끔하게 구성
+            title_cell = f'<a href="{link_esc}">{title_esc}</a>'
+            if src_esc:
+                title_cell += f'<div class="meta">{src_esc}</div>'
 
             parts.append(
                 f"<tr><td>{i}</td><td>{title_cell}</td><td>{pub_esc}</td></tr>"
@@ -157,6 +116,9 @@ def send_gmail(to_email: str, subject: str, body: str):
 
 def load_keywords(path: str = "keywords.txt"):
     keywords = []
+    # 파일이 없을 경우를 대비한 기본값 설정
+    if not os.path.exists(path):
+        return ["인공지능", "경제"] 
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             kw = line.strip()
@@ -167,15 +129,24 @@ def load_keywords(path: str = "keywords.txt"):
 
 
 def main():
+    # 1. keywords.txt에서 키워드 로드
     keywords = load_keywords("keywords.txt")
+    
+    # 2. 각 키워드별 뉴스 수집 (24시간 이내)
     results = {kw: fetch_news(kw, limit=10) for kw in keywords}
 
+    # 3. 이메일 본문 생성 (요약/볼드 제거됨)
     body = build_email_body(results)
-    print(body)
+    print("이메일 본문 생성 완료")
 
-    to_email = os.environ.get("GMAIL_TO", os.environ["GMAIL_USER"])
-    send_gmail(to_email=to_email, subject=f"Google 뉴스 RSS: {', '.join(keywords)}", body=body)
-    print("메일 전송 완료")
+    # 4. 메일 발송
+    try:
+        to_email = os.environ.get("GMAIL_TO", os.environ["GMAIL_USER"])
+        subject = f"데일리 뉴스 리포트: {', '.join(keywords)}"
+        send_gmail(to_email=to_email, subject=subject, body=body)
+        print("메일 전송 완료")
+    except Exception as e:
+        print(f"메일 전송 중 오류 발생: {e}")
 
 
 if __name__ == "__main__":
