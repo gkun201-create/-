@@ -1,7 +1,10 @@
+import html
 import os
 import ssl
 import smtplib
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
+from time import mktime
 from urllib.parse import quote
 
 import feedparser
@@ -12,38 +15,69 @@ def google_news_rss_url(keyword: str, hl="ko", gl="KR", ceid="KR:ko") -> str:
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 
-def fetch_news(keyword: str, limit: int = 10):
+def fetch_news(keyword: str, limit: int = 10, within_hours: int = 24):
     url = google_news_rss_url(keyword)
     feed = feedparser.parse(url)
 
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=within_hours)
     items = []
-    for entry in feed.entries[:limit]:
+    for entry in feed.entries:
+        if len(items) >= limit:
+            break
+        published_str = getattr(entry, "published", "").strip()
+        # 24시간 이내인지 확인 (published_parsed가 있으면)
+        if getattr(entry, "published_parsed", None):
+            pub_dt = datetime.fromtimestamp(mktime(entry.published_parsed), tz=timezone.utc)
+            if pub_dt < cutoff:
+                continue
         title = getattr(entry, "title", "").strip()
         link = getattr(entry, "link", "").strip()
-        published = getattr(entry, "published", "").strip()
-        items.append({"title": title, "link": link, "published": published})
+        items.append({"title": title, "link": link, "published": published_str})
     return items
 
 
 def build_email_body(results: dict) -> str:
-    lines = []
-    lines.append("Google 뉴스 RSS 요약\n")
+    style = """
+    <style>
+    body { font-family: Malgun Gothic, sans-serif; }
+    h2 { color: #333; }
+    h3 { color: #555; margin-top: 1.2em; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 1.5em; }
+    th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+    th { background: #f5f5f5; font-weight: bold; }
+    tr:nth-child(even) { background: #fafafa; }
+    a { color: #1967d2; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    </style>
+    """
+    parts = [f"<html><head>{style}</head><body>", "<h2>Google 뉴스 RSS 요약</h2>"]
     for keyword, items in results.items():
-        lines.append(f"[{keyword}] ({len(items)}개)\n")
+        parts.append(f"<h3>[{html.escape(keyword)}] ({len(items)}개)</h3>")
         if not items:
-            lines.append("- 결과 없음\n")
+            parts.append("<p>결과 없음</p>")
+            continue
+        parts.append(
+            "<table>"
+            "<thead><tr><th>#</th><th>제목</th><th>발행일</th></tr></thead><tbody>"
+        )
         for i, it in enumerate(items, 1):
-            pub = f" ({it['published']})" if it["published"] else ""
-            lines.append(f"{i}. {it['title']}{pub}\n   {it['link']}\n")
-        lines.append("\n")
-    return "".join(lines)
+            title_esc = html.escape(it["title"])
+            link_esc = html.escape(it["link"])
+            pub_esc = html.escape(it["published"]) if it["published"] else ""
+            parts.append(
+                f'<tr><td>{i}</td><td><a href="{link_esc}">{title_esc}</a></td><td>{pub_esc}</td></tr>'
+            )
+        parts.append("</tbody></table>")
+    parts.append("</body></html>")
+    return "".join(parts)
 
 
 def send_gmail(to_email: str, subject: str, body: str):
     gmail_user = os.environ["GMAIL_USER"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
 
-    msg = MIMEText(body, _charset="utf-8")
+    msg = MIMEText(body, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = gmail_user
     msg["To"] = to_email
