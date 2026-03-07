@@ -1,5 +1,6 @@
 import html
 import os
+import re
 import ssl
 import smtplib
 from datetime import datetime, timezone, timedelta
@@ -33,8 +34,61 @@ def fetch_news(keyword: str, limit: int = 10, within_hours: int = 24):
                 continue
         title = getattr(entry, "title", "").strip()
         link = getattr(entry, "link", "").strip()
-        items.append({"title": title, "link": link, "published": published_str})
+        summary_raw = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+        summary_text = _clean_summary(summary_raw)
+
+        source_title = ""
+        try:
+            source_title = getattr(getattr(entry, "source", None), "title", "") or ""
+        except Exception:
+            source_title = ""
+
+        items.append(
+            {
+                "title": title,
+                "link": link,
+                "published": published_str,
+                "summary": summary_text,
+                "source": source_title,
+            }
+        )
     return items
+
+
+def _clean_summary(text: str) -> str:
+    # Google News RSS summary는 HTML이 섞여올 수 있어 텍스트만 남깁니다.
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def _is_ascii(s: str) -> bool:
+    return all(ord(ch) < 128 for ch in (s or ""))
+
+
+def _highlight_keyword(text: str, keyword: str) -> str:
+    """
+    HTML-safe 문자열을 반환하고, keyword 매칭 부분만 <strong> 처리합니다.
+    (대소문자 구분이 애매한 영문 키워드는 IGNORECASE로 처리)
+    """
+    if not text:
+        return ""
+    if not keyword:
+        return html.escape(text)
+
+    flags = re.IGNORECASE if _is_ascii(keyword) else 0
+    pattern = re.compile(re.escape(keyword), flags)
+
+    out = []
+    last = 0
+    for m in pattern.finditer(text):
+        out.append(html.escape(text[last : m.start()]))
+        out.append("<strong>")
+        out.append(html.escape(text[m.start() : m.end()]))
+        out.append("</strong>")
+        last = m.end()
+    out.append(html.escape(text[last:]))
+    return "".join(out)
 
 
 def build_email_body(results: dict) -> str:
@@ -49,6 +103,8 @@ def build_email_body(results: dict) -> str:
     tr:nth-child(even) { background: #fafafa; }
     a { color: #1967d2; text-decoration: none; }
     a:hover { text-decoration: underline; }
+    .meta { color: #666; font-size: 12px; margin-top: 4px; }
+    .summary { color: #222; font-size: 13px; margin-top: 6px; line-height: 1.4; }
     </style>
     """
     parts = [f"<html><head>{style}</head><body>", "<h2>Google 뉴스 RSS 요약</h2>"]
@@ -59,14 +115,25 @@ def build_email_body(results: dict) -> str:
             continue
         parts.append(
             "<table>"
-            "<thead><tr><th>#</th><th>제목</th><th>발행일</th></tr></thead><tbody>"
+            "<thead><tr><th>#</th><th>제목 / 요약</th><th>발행</th></tr></thead><tbody>"
         )
         for i, it in enumerate(items, 1):
-            title_esc = html.escape(it["title"])
             link_esc = html.escape(it["link"])
-            pub_esc = html.escape(it["published"]) if it["published"] else ""
+            pub_esc = html.escape(it.get("published", "") or "")
+            src_esc = html.escape(it.get("source", "") or "")
+
+            title_html = _highlight_keyword(it.get("title", "") or "", keyword)
+            summary_html = _highlight_keyword(it.get("summary", "") or "", keyword) if it.get("summary") else ""
+
+            title_cell = f'<a href="{link_esc}">{title_html}</a>'
+            meta_bits = [b for b in [src_esc] if b]
+            if meta_bits:
+                title_cell += f'<div class="meta">{" · ".join(meta_bits)}</div>'
+            if summary_html:
+                title_cell += f'<div class="summary">{summary_html}</div>'
+
             parts.append(
-                f'<tr><td>{i}</td><td><a href="{link_esc}">{title_esc}</a></td><td>{pub_esc}</td></tr>'
+                f"<tr><td>{i}</td><td>{title_cell}</td><td>{pub_esc}</td></tr>"
             )
         parts.append("</tbody></table>")
     parts.append("</body></html>")
